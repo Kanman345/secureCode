@@ -4,4 +4,4 @@ We're building a sandboxed code execution service — the kind of system that po
 
 ## Threat Model Log
 
-_To be filled in as isolation layers are added (Phase 1+)._
+Phase 1 writes each submission to its own temp directory, but this is filesystem convenience, not isolation — the executed process can still read/write anywhere the server process can, spawn other processes, and reach the network.
