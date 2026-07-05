@@ -3,6 +3,7 @@
 *.exe
 *.test
 *.out
+/cmd/server/server
 
 # macOS
 .DS_Store
