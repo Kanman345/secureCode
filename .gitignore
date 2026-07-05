@@ -1,0 +1,8 @@
+# Go build artifacts
+/cmd/poc/poc
+*.exe
+*.test
+*.out
+
+# macOS
+.DS_Store
