@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 )
 
 type SubmitRequest struct {
@@ -16,10 +19,14 @@ type SubmitRequest struct {
 }
 
 type SubmitResponse struct {
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	ExitCode int    `json:"exit_code"`
+	Status    string `json:"status"`
+	Stdout    string `json:"stdout"`
+	Stderr    string `json:"stderr"`
+	ExitCode  int    `json:"exit_code"`
+	ElapsedMs int64  `json:"elapsed_ms"`
 }
+
+const defaultTimeLimit = 5 * time.Second
 
 func submitHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -46,7 +53,12 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cmd := exec.Command("python3", "solution.py")
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeLimit)
+	defer cancel()
+
+	start := time.Now()
+
+	cmd := exec.CommandContext(ctx, "python3", "solution.py")
 	cmd.Dir = tempDir
 
 	var stdout, stderr bytes.Buffer
@@ -55,9 +67,18 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 
 	runErr := cmd.Run()
 
+	elapsed := time.Since(start)
+	log.Printf("execution took %v", elapsed)
+
+	status := "success"
 	exitCode := 0
-	if runErr != nil {
+
+	if ctx.Err() == context.DeadlineExceeded {
+		status = "time_limit_exceeded"
+		log.Printf("submission killed after %v (limit %v): SIGKILL sent via context deadline", elapsed, defaultTimeLimit)
+	} else if runErr != nil {
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			status = "runtime_error"
 			exitCode = exitErr.ExitCode()
 		} else {
 			http.Error(w, "failed to execute code", http.StatusInternalServerError)
@@ -66,9 +87,11 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := SubmitResponse{
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		ExitCode: exitCode,
+		Status:    status,
+		Stdout:    stdout.String(),
+		Stderr:    stderr.String(),
+		ExitCode:  exitCode,
+		ElapsedMs: elapsed.Milliseconds(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

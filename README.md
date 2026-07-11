@@ -5,3 +5,6 @@ We're building a sandboxed code execution service — the kind of system that po
 ## Threat Model Log
 
 Phase 1 writes each submission to its own temp directory, but this is filesystem convenience, not isolation — the executed process can still read/write anywhere the server process can, spawn other processes, and reach the network.
+
+Phase 2 adds a hard time limit via `context.WithTimeout` + `exec.CommandContext`, so a hung submission is killed and the server stays responsive. However, this only signals the direct child process — a submission that forks children (e.g. a fork bomb) can leave orphaned processes running after the parent is killed. Process-group-based cleanup is deferred to Phase 3.
+
