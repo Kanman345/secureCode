@@ -10,6 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -27,6 +30,64 @@ type SubmitResponse struct {
 }
 
 const defaultTimeLimit = 5 * time.Second
+const cgroupRoot = "/sys/fs/cgroup/sandbox-exec"
+const maxOutputBytes = 1 << 20 // 1MB
+
+func setupCgroupRoot() {
+	if err := os.MkdirAll(cgroupRoot, 0755); err != nil {
+		log.Fatalf("failed to create cgroup root: %v", err)
+	}
+	if err := os.WriteFile("/sys/fs/cgroup/cgroup.subtree_control", []byte("+memory +pids"), 0644); err != nil {
+		log.Fatalf("failed to enable controllers at cgroup root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupRoot, "cgroup.subtree_control"), []byte("+memory +pids"), 0644); err != nil {
+		log.Fatalf("failed to enable controllers on sandbox-exec: %v", err)
+	}
+}
+
+func cgroupHitMemoryLimit(cgroupPath string) bool {
+	data, err := os.ReadFile(filepath.Join(cgroupPath, "memory.events"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if count, ok := strings.CutPrefix(line, "oom_kill "); ok {
+			return strings.TrimSpace(count) != "0"
+		}
+	}
+	return false
+}
+
+func cleanupCgroup(cgroupPath string) {
+	_ = os.WriteFile(filepath.Join(cgroupPath, "cgroup.kill"), []byte("1"), 0644)
+	for i := 0; i < 10; i++ {
+		if err := os.Remove(cgroupPath); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+type limitedWriter struct {
+	buf    *bytes.Buffer
+	limit  int
+	cancel context.CancelFunc
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	remaining := w.limit - w.buf.Len()
+	if remaining <= 0 {
+		w.cancel()
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		w.buf.Write(p[:remaining])
+		w.cancel()
+		return len(p), nil
+	}
+	return w.buf.Write(p)
+}
+
 
 func submitHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -53,6 +114,22 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cgroupPath := filepath.Join(cgroupRoot, filepath.Base(tempDir))
+	if err := os.Mkdir(cgroupPath, 0755); err != nil {
+		http.Error(w, "failed to create cgroup", http.StatusInternalServerError)
+		return
+	}
+	defer cleanupCgroup(cgroupPath)
+
+	if err := os.WriteFile(filepath.Join(cgroupPath, "pids.max"), []byte("20"), 0644); err != nil {
+		http.Error(w, "failed to set pids.max", http.StatusInternalServerError)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "memory.max"), []byte("268435456"), 0644); err != nil {
+		http.Error(w, "failed to set memory.max", http.StatusInternalServerError)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeLimit)
 	defer cancel()
 
@@ -60,22 +137,53 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 
 	cmd := exec.CommandContext(ctx, "python3", "solution.py")
 	cmd.Dir = tempDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stdout = &limitedWriter{buf: &stdout, limit: maxOutputBytes, cancel: cancel}
+	cmd.Stderr = &limitedWriter{buf: &stderr, limit: maxOutputBytes, cancel: cancel}
 
-	runErr := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		http.Error(w, "failed to start process", http.StatusInternalServerError)
+		return
+	}
+
+	pidBytes := []byte(strconv.Itoa(cmd.Process.Pid))
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), pidBytes, 0644); err != nil {
+		log.Printf("failed to add pid %d to cgroup: %v", cmd.Process.Pid, err)
+	}
+
+	runErr := cmd.Wait()
+
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 
 	elapsed := time.Since(start)
 	log.Printf("execution took %v", elapsed)
 
 	status := "success"
 	exitCode := 0
+	oomKilled := cgroupHitMemoryLimit(cgroupPath)
 
 	if ctx.Err() == context.DeadlineExceeded {
 		status = "time_limit_exceeded"
 		log.Printf("submission killed after %v (limit %v): SIGKILL sent via context deadline", elapsed, defaultTimeLimit)
+	} else if ctx.Err() == context.Canceled {
+		status = "output_limit_exceeded"
+	} else if strings.Contains(stderr.String(), "Resource temporarily unavailable") || strings.Contains(stderr.String(), "BlockingIOError") {
+		status = "process_limit_exceeded"
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+	} else if oomKilled {
+		status = "memory_limit_exceeded"
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
 	} else if runErr != nil {
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
 			status = "runtime_error"
@@ -85,6 +193,8 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+
 
 	resp := SubmitResponse{
 		Status:    status,
@@ -99,6 +209,7 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	setupCgroupRoot()
 	http.HandleFunc("/submit", submitHandler)
 	fmt.Println("listening on :8080")
 	http.ListenAndServe(":8080", nil)
