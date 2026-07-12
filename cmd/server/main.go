@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -108,7 +110,13 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer os.RemoveAll(tempDir)
 
-	solutionPath := filepath.Join(tempDir, "solution.py")
+	jailPath := filepath.Join(tempDir, "jail")
+	if err := exec.Command("cp", "-r", "/opt/jail-template", jailPath).Run(); err != nil {
+		http.Error(w, "failed to set up jail", http.StatusInternalServerError)
+		return
+	}
+
+	solutionPath := filepath.Join(jailPath, "tmp", "solution.py")
 	if err := os.WriteFile(solutionPath, []byte(req.Code), 0644); err != nil {
 		http.Error(w, "failed to write solution file", http.StatusInternalServerError)
 		return
@@ -135,9 +143,14 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 
-	cmd := exec.CommandContext(ctx, "python3", "solution.py")
-	cmd.Dir = tempDir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd := exec.CommandContext(ctx, "sh", "-c", "mount -t proc proc /proc && exec python3 /tmp/solution.py")
+	cmd.Dir = "/tmp"
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid:    true,
+		Chroot:     jailPath,
+		Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID,
+	}
+
 	cmd.Cancel = func() error {
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
@@ -150,6 +163,11 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to start process", http.StatusInternalServerError)
 		return
 	}
+	defer func() {
+		if err := syscall.Unmount(filepath.Join(jailPath, "proc"), 0); err != nil {
+			log.Printf("jail /proc unmount (likely already gone): %v", err)
+		}
+	}()
 
 	pidBytes := []byte(strconv.Itoa(cmd.Process.Pid))
 	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), pidBytes, 0644); err != nil {
