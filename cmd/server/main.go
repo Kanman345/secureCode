@@ -10,11 +10,9 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
+	"runtime"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -103,132 +101,43 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tempDir, err := os.MkdirTemp("", "sandbox-exec-*")
-	if err != nil {
-		http.Error(w, "failed to create temp dir", http.StatusInternalServerError)
+	job := Job{
+		Code:     req.Code,
+		Language: req.Language,
+		Result:   make(chan SubmitResponse, 1),
+	}
+
+	select {
+	case jobQueue <- job:
+		// accepted, fall through to wait for result
+	default:
+		http.Error(w, "server busy, try again later", http.StatusServiceUnavailable)
 		return
-	}
-	defer os.RemoveAll(tempDir)
-
-	jailPath := filepath.Join(tempDir, "jail")
-	if err := exec.Command("cp", "-r", "/opt/jail-template", jailPath).Run(); err != nil {
-		http.Error(w, "failed to set up jail", http.StatusInternalServerError)
-		return
-	}
-
-	solutionPath := filepath.Join(jailPath, "tmp", "solution.py")
-	if err := os.WriteFile(solutionPath, []byte(req.Code), 0644); err != nil {
-		http.Error(w, "failed to write solution file", http.StatusInternalServerError)
-		return
-	}
-
-	cgroupPath := filepath.Join(cgroupRoot, filepath.Base(tempDir))
-	if err := os.Mkdir(cgroupPath, 0755); err != nil {
-		http.Error(w, "failed to create cgroup", http.StatusInternalServerError)
-		return
-	}
-	defer cleanupCgroup(cgroupPath)
-
-	if err := os.WriteFile(filepath.Join(cgroupPath, "pids.max"), []byte("20"), 0644); err != nil {
-		http.Error(w, "failed to set pids.max", http.StatusInternalServerError)
-		return
-	}
-	if err := os.WriteFile(filepath.Join(cgroupPath, "memory.max"), []byte("268435456"), 0644); err != nil {
-		http.Error(w, "failed to set memory.max", http.StatusInternalServerError)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeLimit)
-	defer cancel()
-
-	start := time.Now()
-
-	cmd := exec.CommandContext(ctx, "sh", "-c", "mount -t proc proc /proc && exec python3 /tmp/solution.py")
-	cmd.Dir = "/tmp"
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid:    true,
-		Chroot:     jailPath,
-		Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID,
-	}
-
-	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &limitedWriter{buf: &stdout, limit: maxOutputBytes, cancel: cancel}
-	cmd.Stderr = &limitedWriter{buf: &stderr, limit: maxOutputBytes, cancel: cancel}
-
-	if err := cmd.Start(); err != nil {
-		http.Error(w, "failed to start process", http.StatusInternalServerError)
-		return
-	}
-	defer func() {
-		if err := syscall.Unmount(filepath.Join(jailPath, "proc"), 0); err != nil {
-			log.Printf("jail /proc unmount (likely already gone): %v", err)
-		}
-	}()
-
-	pidBytes := []byte(strconv.Itoa(cmd.Process.Pid))
-	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), pidBytes, 0644); err != nil {
-		log.Printf("failed to add pid %d to cgroup: %v", cmd.Process.Pid, err)
-	}
-
-	runErr := cmd.Wait()
-
-	if cmd.Process != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-
-	elapsed := time.Since(start)
-	log.Printf("execution took %v", elapsed)
-
-	status := "success"
-	exitCode := 0
-	oomKilled := cgroupHitMemoryLimit(cgroupPath)
-
-	if ctx.Err() == context.DeadlineExceeded {
-		status = "time_limit_exceeded"
-		log.Printf("submission killed after %v (limit %v): SIGKILL sent via context deadline", elapsed, defaultTimeLimit)
-	} else if ctx.Err() == context.Canceled {
-		status = "output_limit_exceeded"
-	} else if strings.Contains(stderr.String(), "Resource temporarily unavailable") || strings.Contains(stderr.String(), "BlockingIOError") {
-		status = "process_limit_exceeded"
-		if exitErr, ok := runErr.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		}
-	} else if oomKilled {
-		status = "memory_limit_exceeded"
-		if exitErr, ok := runErr.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		}
-	} else if runErr != nil {
-		if exitErr, ok := runErr.(*exec.ExitError); ok {
-			status = "runtime_error"
-			exitCode = exitErr.ExitCode()
-		} else {
-			http.Error(w, "failed to execute code", http.StatusInternalServerError)
-			return
-		}
-	}
-
-
-
-	resp := SubmitResponse{
-		Status:    status,
-		Stdout:    stdout.String(),
-		Stderr:    stderr.String(),
-		ExitCode:  exitCode,
-		ElapsedMs: elapsed.Milliseconds(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+
+	select {
+	case resp := <-job.Result:
+		json.NewEncoder(w).Encode(resp)
+	case <-time.After(queueWaitTimeout):
+		w.WriteHeader(http.StatusGatewayTimeout)
+		json.NewEncoder(w).Encode(SubmitResponse{Status: "queue_timeout"})
+	}
 }
 
 func main() {
 	setupCgroupRoot()
+
+	numWorkers := runtime.NumCPU()
+	if numWorkers < 4 {
+		numWorkers = 4
+	}
+	startWorkerPool(numWorkers)
+	log.Printf("worker pool started: %d workers, queue size %d", numWorkers, queueSize)
+
 	http.HandleFunc("/submit", submitHandler)
 	fmt.Println("listening on :8080")
 	http.ListenAndServe(":8080", nil)
 }
+
