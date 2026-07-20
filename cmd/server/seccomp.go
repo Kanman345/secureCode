@@ -38,6 +38,10 @@ var seccompWhitelist = []string{
 	"exit", "exit_group", "gettid", "getpid", "getppid",
 	"set_tid_address", "set_robust_list", "rseq",
 	"sched_getaffinity", "sched_yield", "prlimit64",
+	// uid/gid queries -- CPython's startup checks these unconditionally
+	// (confirmed via strace on the target VM, 2026-07-20); purely
+	// informational, can't be used to change privilege or read/write anything.
+	"getuid", "geteuid", "getgid", "getegid",
 
 	// signals
 	"rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "sigaltstack", "tgkill",
