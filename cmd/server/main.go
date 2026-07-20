@@ -127,6 +127,19 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// Re-exec entry point used by worker.go to apply chroot + seccomp from a
+	// fresh, single-threaded process before handing off to python3. See
+	// runSandboxInit in seccomp.go for why this has to be a re-exec rather
+	// than inline setup in the parent.
+	if len(os.Args) > 1 && os.Args[1] == "__sandbox_init__" {
+		if len(os.Args) != 4 {
+			fmt.Fprintln(os.Stderr, "sandbox-init: usage: __sandbox_init__ <jailPath> <solutionPath>")
+			os.Exit(1)
+		}
+		runSandboxInit(os.Args[2], os.Args[3])
+		return // unreachable: runSandboxInit always exec's or os.Exit's
+	}
+
 	setupCgroupRoot()
 
 	numWorkers := runtime.NumCPU()

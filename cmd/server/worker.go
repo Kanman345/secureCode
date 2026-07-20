@@ -74,16 +74,24 @@ func executeJob(code, language string) SubmitResponse {
 		return errorResult("failed to set memory.max")
 	}
 
+	selfPath, err := os.Executable()
+	if err != nil {
+		return errorResult("failed to resolve server binary path")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeLimit)
 	defer cancel()
 
 	start := time.Now()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", "mount -t proc proc /proc && exec python3 /tmp/solution.py")
-	cmd.Dir = "/tmp"
+	// The immediate child is this same binary, re-exec'd in sandbox-init mode
+	// (see runSandboxInit in seccomp.go). It mounts /proc, chroots into
+	// jailPath, loads the seccomp filter, and only then exec's python3 --
+	// chroot is intentionally NOT set here in SysProcAttr, since it needs to
+	// happen after the /proc mount but before the seccomp filter is loaded.
+	cmd := exec.CommandContext(ctx, selfPath, "__sandbox_init__", jailPath, "/tmp/solution.py")
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid:    true,
-		Chroot:     jailPath,
 		Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNET,
 	}
 
