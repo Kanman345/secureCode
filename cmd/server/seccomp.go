@@ -12,12 +12,12 @@ import (
 )
 
 // seccompKillOnViolation picks the default action for any syscall not on the
-// whitelist. false (SCMP_ACT_ERRNO -> EPERM) is the safer choice while the
-// whitelist is still being discovered: a blocked syscall shows up as a normal
-// Python errno/exception instead of a silent SIGSYS kill with no diagnostic.
-// Flip to true only after the whitelist below has been verified with strace
-// against real submissions on the target Linux VM -- see README Phase 7.
-const seccompKillOnViolation = false
+// whitelist. Verified true on the Multipass VM (2026-07-20): basic
+// submissions, all Phase 2-6 evil tests, and ptrace_attempt.py all land on
+// their expected outcomes at SCMP_ACT_ERRNO, so this is now switched to
+// SCMP_ACT_KILL for production use. See README Phase 7 for the verification
+// log; flip back to false only if debugging a new syscall gap.
+const seccompKillOnViolation = true
 
 // seccompWhitelist is a starting-point set of syscalls a bare CPython 3
 // interpreter needs to start up and run typical algorithmic submissions
