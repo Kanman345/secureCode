@@ -28,8 +28,13 @@ const seccompKillOnViolation = false
 // Deliberately excluded: clone/clone3/fork/vfork (submissions are
 // single-threaded algorithmic solutions with no legitimate need to spawn
 // processes or threads -- this makes fork-bomb containment redundant with
-// Phase 3's cgroup pids.max), ptrace, mount/umount2, socket/connect/bind (see
-// README for the full rationale).
+// Phase 3's cgroup pids.max), ptrace, mount/umount2, chroot, socket/connect/
+// bind (see README for the full rationale). chroot's exclusion was initially
+// incidental (just never added), but confirmed as the right call by
+// tests/evil/escape_attempt.py on the Multipass VM: the submission process
+// has no legitimate reason to call chroot itself, so blocking it at the
+// syscall level (in addition to it already being harmless per the Phase 4
+// mount-namespace containment) is straightforward defense in depth.
 //
 // execve/execveat are NOT excluded, despite the reasoning above suggesting
 // they could be: the seccomp filter is loaded by this same process
