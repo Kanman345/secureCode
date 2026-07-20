@@ -69,6 +69,13 @@ var seccompWhitelist = []string{
 	"openat", "close", "close_range", "lseek", "dup", "dup2", "dup3", "fcntl",
 	"ioctl", "getdents64", "readlink", "readlinkat", "getcwd",
 	"fstat", "newfstatat", "statx", "access", "faccessat", "faccessat2",
+	// renameat/renameat2 -- CPython writes its __pycache__ bytecode cache
+	// atomically (temp file + rename) on every module import; missing this
+	// silently no-op'd under SCMP_ACT_ERRNO (Python just skips caching on a
+	// failed write) but killed every single submission once switched to
+	// SCMP_ACT_KILL -- found via `dmesg | grep seccomp` showing
+	// comm="python3" syscall=38 (renameat on arm64), 2026-07-20.
+	"renameat", "renameat2",
 
 	// time
 	"clock_gettime", "gettimeofday", "clock_nanosleep", "nanosleep", "clock_getres",
