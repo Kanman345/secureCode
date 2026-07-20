@@ -25,17 +25,30 @@ const seccompKillOnViolation = false
 // well-documented CPython syscall usage, NOT yet verified with strace against
 // this project's actual jail-template Python build -- that verification can
 // only happen on Linux (see the Multipass checklist in README Phase 7).
-// Deliberately excluded: clone/clone3/fork/vfork/execve/execveat (submissions
-// are single-threaded algorithmic solutions with no legitimate need to spawn
+// Deliberately excluded: clone/clone3/fork/vfork (submissions are
+// single-threaded algorithmic solutions with no legitimate need to spawn
 // processes or threads -- this makes fork-bomb containment redundant with
 // Phase 3's cgroup pids.max), ptrace, mount/umount2, socket/connect/bind (see
 // README for the full rationale).
+//
+// execve/execveat are NOT excluded, despite the reasoning above suggesting
+// they could be: the seccomp filter is loaded by this same process
+// (runSandboxInit) immediately before it calls syscall.Exec to become
+// python3, and a loaded filter applies to every subsequent syscall the
+// calling thread makes -- including that handoff execve itself. Omitting it
+// made the sandbox-init -> python3 handoff fail with EPERM on every
+// submission (discovered on the Multipass VM, 2026-07-20). The residual risk
+// of allowing execve inside python3 is mitigated by the jail's contents, not
+// the filter: the chroot only contains the python3 binary and its own
+// libraries, so there is nothing else present for a stray os.execve() call
+// to target.
 var seccompWhitelist = []string{
 	// memory management
 	"mmap", "munmap", "mprotect", "brk", "mremap", "madvise",
 
-	// process/thread bookkeeping -- NOT clone/fork/execve, see doc comment above
-	"exit", "exit_group", "gettid", "getpid", "getppid",
+	// process/thread bookkeeping -- NOT clone/fork; execve IS included, see
+	// doc comment above for why
+	"exit", "exit_group", "execve", "gettid", "getpid", "getppid",
 	"set_tid_address", "set_robust_list", "rseq",
 	"sched_getaffinity", "sched_yield", "prlimit64",
 	// uid/gid queries -- CPython's startup checks these unconditionally
