@@ -1,20 +1,117 @@
 # Sandboxed Code Execution Service
 
-We're building a sandboxed code execution service — the kind of system that powers platforms like LeetCode, Codeforces, and Judge0 under the hood. The core problem it solves is trust: when a platform lets strangers submit arbitrary code and runs it on shared server infrastructure, that code could accidentally or maliciously hang the server with an infinite loop, exhaust memory or spawn endless processes, read files it shouldn't (other users' data, secrets, credentials), or reach out over the network to attack other systems. The project's job is to take untrusted user-submitted code and execute it safely by stripping away, layer by layer, the default capabilities any process would normally have — enforcing time limits, memory/process limits, filesystem isolation, and (as a stretch) network isolation and syscall restrictions — so the code can compute its answer and nothing else. Alongside the sandboxing itself, it's also a real backend engineering exercise: an API that accepts submissions, a worker pool that executes them concurrently and safely, and a result-reporting layer, all built to survive genuinely adversarial input.
+A Go service that takes untrusted, user-submitted code and runs it safely — the kind of engine that sits behind LeetCode, Codeforces, or Judge0. It accepts a code submission over HTTP, executes it inside a locked-down sandbox, and returns stdout/stderr/exit code, without letting the submission touch anything it shouldn't.
 
-## Threat Model Log
+## The problem
 
-Phase 1 writes each submission to its own temp directory, but this is filesystem convenience, not isolation — the executed process can still read/write anywhere the server process can, spawn other processes, and reach the network.
+Letting strangers run arbitrary code on your infrastructure is inherently adversarial. A submission — accidentally or on purpose — could:
 
-Phase 2 adds a hard time limit via `context.WithTimeout` + `exec.CommandContext`, so a hung submission is killed and the server stays responsive. However, this only signals the direct child process — a submission that forks children (e.g. a fork bomb) can leave orphaned processes running after the parent is killed. Process-group-based cleanup is deferred to Phase 3.
+- hang forever, or fork itself into a denial-of-service
+- exhaust memory or spawn unbounded processes
+- read files it has no business touching (other users' data, host secrets, the server's own source)
+- reach out over the network to attack something else
+- try to escape the sandbox itself (`ptrace`, `chroot` tricks, raw syscalls)
 
-Phase 3 closes the process-group and resource-exhaustion gaps left by Phase 2. Every submission now runs inside its own cgroup v2 (`pids.max`, `memory.max`), scoped per-request rather than shared across the whole OS user. An initial `RLIMIT_NPROC` (`ulimit -u`) approach was abandoned after it took down the entire dev VM: `RLIMIT_NPROC` is scoped by UID system-wide, not per-submission, so once a fork bomb pushed the shared user's process count to the cap, sshd itself couldn't fork a handler for new connections. `RLIMIT_AS` (`ulimit -v`) was likewise replaced by cgroup `memory.max`, which triggers an uncatchable, per-cgroup OOM kill instead of a catchable Python `MemoryError`. The submission's process now also runs in its own process group (`Setpgid`), and both the timeout and a new 1MB stdout/stderr cap kill the whole group via `syscall.Kill(-pgid, SIGKILL)` instead of just the direct child, closing the orphaned-children gap. Filesystem and network isolation remain out of scope — Phase 4.
+This service handles all of that by stripping a process down, layer by layer, to only the capabilities it legitimately needs to compute an answer.
 
-Phase 4 closes the filesystem and process-visibility gaps flagged at the end of Phase 3. Each submission now runs inside a `chroot`'d jail — a minimal root filesystem containing just the Python interpreter, its shared libraries, and the standard library — combined with a new mount namespace (`CLONE_NEWNS`) and PID namespace (`CLONE_NEWPID`). The process can no longer read anything outside its own jail (`/etc/passwd`, the server's own source, other submissions' temp directories all return "not found"), and it can no longer see any process on the host: it shows up as PID 1 in its own namespace, with a freshly mounted `/proc` scoped to just itself rather than inherited from the host. A classic `chroot`-only escape (repeatedly `mkdir` + `chdir`, then `chroot('.')` from the deepest directory to climb past the jail root) was tested directly against this setup: the syscalls succeed, since the sandboxed process still runs as root, but the mount namespace means there is no host filesystem tree reachable to climb into — the escape lands in an empty, self-created directory rather than the real root. Syscall restriction (seccomp) remains out of scope, as noted in the intro above — see Phase 6 for network isolation.
+## Isolation layers
 
-Phase 5 turns single-submission handling into a bounded worker pool so multiple submissions execute concurrently instead of serializing behind one HTTP handler. A fixed pool of goroutines (`runtime.NumCPU()`, floored at 4 to stay useful on this 2-vCPU dev VM, since each worker spends nearly all its time blocked on `cmd.Wait()` rather than burning CPU) pulls jobs off a 100-slot buffered channel; `/submit` now builds a `Job`, pushes it with a non-blocking send, and returns `503` immediately if the queue is full rather than let requests pile up unbounded — the buffer absorbs bursts, the 503 is the honest answer once it's genuinely saturated. A separate 30s queue-wait timeout (distinct from the existing 5s execution timeout) protects against a request waiting forever if it never reaches a worker, returning `queue_timeout` instead of hanging; a job's per-job result channel is deliberately buffered (capacity 1) so a worker that finishes after its caller has already timed out can still deliver its result without blocking forever, which would otherwise leak one worker per timeout. Per-job resource paths (temp dirs, cgroups) were audited rather than changed: `os.MkdirTemp`'s uniqueness guarantee already makes cgroup paths collision-free under concurrency, since each is a pure function of an already-unique temp dir. `go run -race` confirmed no data races — the only state shared across worker goroutines is the job channel itself (self-synchronizing) and the stdlib `log.Logger` (documented safe for concurrent use), so no locks were needed anywhere. Verified with 8 concurrent 2-second submissions completing in ~4.5s wall-clock against 4 workers (vs. ~16s serial), and with the full Phase 2-4 evil test suite (fork bomb, memory bomb, infinite loop, output flood, chroot escape, host file read, process visibility) fired concurrently alongside normal submissions — every evil payload still hit its expected contained outcome, and normal jobs were neither delayed nor corrupted by running alongside them. One known gap: a `queue_timeout` response does not cancel the underlying job — it still runs to completion in its worker, consuming capacity for a client that's already given up. True cancellation would need a `context`/cancellation signal threaded through `Job` into `executeJob`, deferred as a future improvement. Syscall restriction remains out of scope, as noted above — see Phase 6 for network isolation.
+Each layer closes a specific gap left by the one before it. Full build log with the reasoning, dead ends, and on-VM verification for each: **[THREAT_MODEL.md](THREAT_MODEL.md)**.
 
+| Layer | Mechanism | Stops |
+|---|---|---|
+| Time limit | `context.WithTimeout` + process-group `SIGKILL` | Infinite loops, hung processes |
+| Resource limits | cgroup v2 `pids.max` / `memory.max` | Fork bombs, memory exhaustion |
+| Output cap | 1MB stdout/stderr limit | Disk/log-filling output floods |
+| Filesystem isolation | `chroot` into a minimal jail + mount namespace | Reading host files, other submissions' data |
+| Process isolation | PID namespace | Seeing or signaling other processes on the host |
+| Concurrency | Bounded worker pool + queue | One slow submission blocking every other request |
+| Network isolation | Empty network namespace (`CLONE_NEWNET`) | Outbound requests, DNS exfiltration, SSRF |
+| Syscall filtering | seccomp-bpf whitelist, `SCMP_ACT_KILL` | `ptrace`, `mount`, raw sockets, anything not explicitly allowed — even attack vectors nobody thought to name individually |
 
-Phase 6 closes the last named gap from Phase 4: network access. Each submission's process now also gets a new network namespace (`CLONE_NEWNET`), added alongside the existing mount and PID namespaces in the same `Cloneflags` value. A fresh network namespace starts with zero interfaces — not even loopback is brought up — so the flag alone provides full isolation with no veth pairs, bridges, or NAT rules required, unlike a design that wanted to grant *limited* network access rather than none. Loopback was deliberately left down: submissions are algorithmic problem solutions with no legitimate reason to open a socket to themselves. Verified with three new evil tests: an outbound HTTP request (`http_request.py`), a raw socket connect to both a public IP and 127.0.0.1 (`raw_socket.py`), and a DNS lookup (`dns_lookup.py`) — all three fail as expected (`Network is unreachable` for the raw socket attempts, `Temporary failure in name resolution` for the DNS-dependent ones), and the full Phase 1-5 evil test suite plus normal submissions still pass unaffected running alongside them. Syscall restriction (seccomp) remains the one item still out of scope, flagged since Phase 4.
+Every layer above has a corresponding adversarial test in [`tests/evil/`](tests/evil/) that verifies it actually holds.
 
+## API
 
+**`POST /submit`**
+
+```bash
+curl -X POST localhost:8080/submit \
+  -H 'Content-Type: application/json' \
+  -d '{"code": "print(\"hello world\")", "language": "python"}'
+```
+
+```json
+{
+  "status": "success",
+  "stdout": "hello world\n",
+  "stderr": "",
+  "exit_code": 0,
+  "elapsed_ms": 44
+}
+```
+
+`status` is one of:
+
+| Status | Meaning |
+|---|---|
+| `success` | Ran to completion within all limits |
+| `runtime_error` | Non-zero exit, or killed by the seccomp filter / another sandbox boundary |
+| `time_limit_exceeded` | Hit the execution deadline |
+| `memory_limit_exceeded` | Killed by the cgroup OOM killer |
+| `process_limit_exceeded` | Hit the cgroup `pids.max` cap |
+| `output_limit_exceeded` | Exceeded the stdout/stderr cap |
+| `queue_timeout` | Sat in the queue too long without reaching a worker |
+| `internal_error` | Sandbox setup itself failed (not the submission's fault) |
+
+A `503` means the queue is full — the server is honestly saturated rather than silently piling up unbounded work.
+
+## Requirements
+
+This only runs on Linux — it depends on cgroup v2, Linux namespaces, and seccomp-bpf, none of which exist on macOS. Development happens on macOS with a Linux VM (Multipass) for building, running, and testing.
+
+- Linux kernel with cgroup v2 (unified hierarchy) mounted at `/sys/fs/cgroup`
+- Go 1.26+
+- `libseccomp-dev` (the C library `libseccomp-golang` binds to)
+- Python 3 on the host, to build the jail
+- A minimal jail rootfs at `/opt/jail-template` — see below
+
+## Setup
+
+```bash
+sudo apt install -y libseccomp-dev python3
+go build -o server ./cmd/server
+```
+
+**Jail template**: `/opt/jail-template` needs to be a minimal root filesystem containing the `python3` binary, its shared libraries (including `libffi`, which `ctypes` needs but a plain `ldd python3` won't reveal), and the Python standard library. This directory is host-local setup, not part of the repo — each submission's jail is a fresh `cp -r` of it (`cmd/server/worker.go`).
+
+Run it:
+
+```bash
+sudo ./server
+# listening on :8080
+```
+
+(`sudo` because setting up cgroups, namespaces, and `chroot` all require root.)
+
+## Testing
+
+```bash
+./evil_load_test.sh
+```
+
+Fires every file in `tests/evil/` — fork bombs, memory bombs, infinite loops, host file reads, network exfiltration attempts, a `chroot` escape, a `ptrace`-based sandbox escape — concurrently alongside normal submissions, and prints each result. Every evil payload should land on a contained/blocked outcome; normal submissions should all succeed.
+
+## Project structure
+
+```
+cmd/server/       HTTP API, worker pool, sandbox execution, seccomp filter
+cmd/poc/          throwaway os/exec proof-of-concept, not part of the service
+tests/evil/       adversarial test cases, one per attack vector
+evil_load_test.sh runs the full evil suite concurrently against a running server
+THREAT_MODEL.md   phase-by-phase build log and design rationale
+```
+
+## Status
+
+A from-scratch build exercise in sandboxing and backend engineering, not a production-hardened service — see [THREAT_MODEL.md](THREAT_MODEL.md) for exactly what's been verified and what's still open at each layer.
