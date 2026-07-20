@@ -84,7 +84,7 @@ func executeJob(code, language string) SubmitResponse {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid:    true,
 		Chroot:     jailPath,
-		Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID,
+		Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNET,
 	}
 
 	cmd.Cancel = func() error {
